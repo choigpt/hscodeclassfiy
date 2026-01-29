@@ -19,10 +19,12 @@ scikit-learn>=1.3.0  # Metrics
 
 # ML Baseline (Phase 1)
 xgboost>=2.0.0  # Gradient boosting
+lightgbm>=4.0.0  # LightGBM for ranker
 numpy>=1.24.0
 matplotlib>=3.7.0  # Visualization
 seaborn>=0.12.0  # Statistical plots
 joblib>=1.3.0  # Model persistence
+rank-bm25>=0.2.2  # BM25 baseline
 
 # Vector search (Optional - pgvector 사용 시)
 # pgvector>=0.2.4

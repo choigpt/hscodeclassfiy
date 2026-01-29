@@ -1,0 +1,142 @@
+# HS4 Classification Benchmark Configuration
+# 연구 질문: 구조화된 법적/해설서 기반 KB가 베이스라인 대비 정확도와 신뢰도를 개선하는가?
+
+experiment:
+  name: "hs4_classification_benchmark"
+  version: "1.0.0"
+  seed: 42
+  output_dir: "artifacts/reports"
+
+# 데이터 설정
+data:
+  source_path: "data/ruling_cases/all_cases_full_v7.json"
+  benchmark_dir: "data/benchmarks"
+
+  # 분할 설정
+  split:
+    train_ratio: 0.70
+    val_ratio: 0.15
+    test_ratio: 0.15
+    stratify: true
+    min_samples_per_class: 3  # 클래스별 최소 샘플 수
+    temporal_split: false  # true시 시간 기반 분할
+
+# 모델 설정
+models:
+  # 베이스라인
+  baselines:
+    B0_tfidf_lr:
+      type: "tfidf_lr"
+      enabled: true
+      params:
+        max_features: 10000
+        ngram_range: [1, 2]
+        C: 1.0
+
+    B1_sbert_lr:
+      type: "sbert_lr"
+      enabled: true
+      params:
+        st_model: "jhgan/ko-sroberta-multitask"
+        C: 1.0
+
+    B2_bm25:
+      type: "bm25"
+      enabled: true
+      params:
+        k1: 1.5
+        b: 0.75
+        topk: 50
+
+  # Ablation 모델 (파이프라인 기반)
+  ablations:
+    P1_ml_only:
+      description: "ML only (no KB)"
+      use_gri: false
+      use_8axis: false
+      use_rules: false
+      use_ranker: false
+      use_questions: false
+
+    P2_plus_gri:
+      description: "ML + GRI signals"
+      use_gri: true
+      use_8axis: false
+      use_rules: false
+      use_ranker: false
+      use_questions: false
+
+    P3_plus_8axis:
+      description: "ML + GRI + 8-axis attributes"
+      use_gri: true
+      use_8axis: true
+      use_rules: false
+      use_ranker: false
+      use_questions: false
+
+    P4_plus_rules:
+      description: "ML + GRI + 8-axis + KB rules"
+      use_gri: true
+      use_8axis: true
+      use_rules: true
+      use_ranker: false
+      use_questions: false
+
+    P5_plus_ranker:
+      description: "ML + GRI + 8-axis + rules + LightGBM ranker"
+      use_gri: true
+      use_8axis: true
+      use_rules: true
+      use_ranker: true
+      use_questions: false
+
+    P6_full:
+      description: "Full pipeline with question generation"
+      use_gri: true
+      use_8axis: true
+      use_rules: true
+      use_ranker: true
+      use_questions: true
+
+# 평가 설정
+evaluation:
+  # Core metrics
+  metrics:
+    - top1_accuracy
+    - top3_accuracy
+    - top5_accuracy
+    - macro_f1
+    - weighted_f1
+    - coverage
+
+  # Calibration
+  calibration:
+    enabled: true
+    n_bins: 10
+    metrics:
+      - ece  # Expected Calibration Error
+      - brier_score
+      - reliability_curve
+
+  # Routing analysis
+  routing:
+    enabled: true
+    thresholds:
+      auto: 0.7      # 고신뢰도 자동 분류
+      review: 0.4    # 전문가 검토 필요
+      # ask: 0.4-0.7  # 추가 정보 요청
+
+  # Error analysis
+  error_analysis:
+    enabled: true
+    confusion_pairs_topk: 20
+    failure_samples: 20
+    chapter_breakdown: true
+
+# 출력 설정
+outputs:
+  benchmark_summary: "benchmark_summary.csv"
+  ablation_table: "ablation_table.csv"
+  confusion_pairs: "confusion_pairs.csv"
+  calibration: "calibration.json"
+  failure_cases: "failure_cases.jsonl"

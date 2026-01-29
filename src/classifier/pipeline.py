@@ -28,6 +28,13 @@ class HSPipeline:
     - ML + KB 합집합 후보 생성 (GRI 기반 조정)
     - GRI 피처 기반 Reranking
     - Label space 진단
+
+    Ablation 토글 파라미터:
+    - use_gri: GRI 신호 탐지 사용 여부
+    - use_8axis: 8축 전역 속성 사용 여부
+    - use_rules: KB 규칙 매칭 사용 여부
+    - use_ranker: LightGBM ranker 사용 여부
+    - use_questions: 저신뢰도 질문 생성 여부
     """
 
     def __init__(
@@ -37,7 +44,13 @@ class HSPipeline:
         clarifier: Optional[HSClarifier] = None,
         ml_topk: int = 50,
         kb_topk: int = 30,
-        ranker_model_path: Optional[str] = None
+        ranker_model_path: Optional[str] = None,
+        # Ablation 토글 파라미터
+        use_gri: bool = True,
+        use_8axis: bool = True,
+        use_rules: bool = True,
+        use_ranker: bool = True,
+        use_questions: bool = True
     ):
         self.retriever = retriever or HSRetriever()
         self.reranker = reranker or HSReranker()
@@ -46,13 +59,20 @@ class HSPipeline:
         self.ml_topk = ml_topk
         self.kb_topk = kb_topk
 
+        # Ablation 토글 설정
+        self.use_gri = use_gri
+        self.use_8axis = use_8axis
+        self.use_rules = use_rules
+        self.use_ranker = use_ranker
+        self.use_questions = use_questions
+
         # Label space 캐시
         self._model_classes: Optional[Set[str]] = None
         self._kb_classes: Optional[Set[str]] = None
 
         # LightGBM ranker (옵션)
         self.ranker_model = None
-        if ranker_model_path:
+        if ranker_model_path and use_ranker:
             self._load_ranker(ranker_model_path)
 
     def _load_ranker(self, path: str):
@@ -170,9 +190,14 @@ class HSPipeline:
         """
         debug: Dict[str, Any] = {}
 
-        # Step 0: GRI 신호 탐지 + 전역 속성 추출
-        gri_signals = detect_gri_signals(text)
-        parts_signal = detect_parts_signal(text)
+        # Step 0: GRI 신호 탐지 + 전역 속성 추출 (Ablation 토글)
+        if self.use_gri:
+            gri_signals = detect_gri_signals(text)
+            parts_signal = detect_parts_signal(text)
+        else:
+            gri_signals = GRISignals()  # 빈 신호
+            parts_signal = {'is_parts': False, 'matched': []}
+
         input_attrs = extract_attributes(text)
 
         debug['gri_signals'] = gri_signals.to_dict()
@@ -180,6 +205,13 @@ class HSPipeline:
         debug['active_gri'] = gri_signals.active_signals()
         debug['input_attrs'] = input_attrs.to_dict()
         debug['attrs_summary'] = input_attrs.summary()
+        debug['ablation'] = {
+            'use_gri': self.use_gri,
+            'use_8axis': self.use_8axis,
+            'use_rules': self.use_rules,
+            'use_ranker': self.use_ranker,
+            'use_questions': self.use_questions,
+        }
 
         # Step 1: ML Top-K 후보 생성
         ml_candidates = []
@@ -192,9 +224,9 @@ class HSPipeline:
             for c in ml_candidates[:5]
         ]
 
-        # Step 2: KB 후보 생성 (GRI + 속성 기반 조정)
+        # Step 2: KB 후보 생성 (GRI + 속성 기반 조정) - Ablation 토글
         kb_candidates = []
-        if include_kb_candidates:
+        if include_kb_candidates and self.use_rules:
             # GRI 신호에 따라 KB topk 조정
             actual_kb_topk = self.kb_topk
             if gri_signals.gri2a_incomplete:
@@ -234,15 +266,22 @@ class HSPipeline:
         if not_in_model_list:
             debug['not_in_model_hs4'] = not_in_model_list
 
-        # Step 4: Rerank (GRI + 속성 피처 포함)
+        # Step 4: Rerank (GRI + 속성 피처 포함) - Ablation 토글
+        # 8축 속성은 use_8axis 플래그에 따라 전달
+        input_attrs_8axis = None
+        if self.use_8axis:
+            from .attribute_extract import extract_attributes_8axis
+            input_attrs_8axis = extract_attributes_8axis(text)
+
         reranked, rerank_stats = self.reranker.rerank(
             text,
             candidates,
             topk=topk,
-            gri_signals=gri_signals,
+            gri_signals=gri_signals if self.use_gri else None,
             input_attrs=input_attrs,
+            input_attrs_8axis=input_attrs_8axis,
             model_classes=model_classes,
-            ranker_model=self.ranker_model
+            ranker_model=self.ranker_model if self.use_ranker else None
         )
         debug['rerank_stats'] = rerank_stats
         debug['reranked_top5'] = [
@@ -273,9 +312,9 @@ class HSPipeline:
             low_confidence = True
             debug['no_kb_hits'] = True
 
-        # Step 6: GRI + 속성 충돌 기반 질문 생성
+        # Step 6: GRI + 속성 충돌 기반 질문 생성 (Ablation 토글)
         questions = []
-        if low_confidence:
+        if low_confidence and self.use_questions:
             hs4_list = [c.hs4 for c in reranked]
             questions = self.clarifier.get_questions_with_context(
                 hs4_list,

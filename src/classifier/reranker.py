@@ -1335,6 +1335,73 @@ class StabilityPolicy:
         return missing_count >= 3
 
 
+    def export_features(
+        self,
+        text: str,
+        candidates: List[Candidate],
+        gri_signals: Optional[GRISignals] = None,
+        input_attrs: Optional[GlobalAttributes] = None,
+        input_attrs_8axis: Optional[GlobalAttributes8Axis] = None,
+        model_classes: Optional[Set[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        후보별 피처 벡터 export (분석/학습용)
+
+        Args:
+            text: 입력 텍스트
+            candidates: 후보 리스트
+            gri_signals: GRI 신호
+            input_attrs: 입력 속성 (기존)
+            input_attrs_8axis: 입력 8축 속성
+            model_classes: 모델 클래스 집합
+
+        Returns:
+            [{hs4, features_dict, feature_vector, feature_names}, ...]
+        """
+        if gri_signals is None:
+            gri_signals = detect_gri_signals(text)
+        if input_attrs is None:
+            input_attrs = extract_attributes(text)
+        if input_attrs_8axis is None:
+            input_attrs_8axis = extract_attributes_8axis(text)
+
+        results = []
+        for cand in candidates:
+            features = self.compute_features(
+                text, cand, gri_signals, input_attrs, model_classes, input_attrs_8axis
+            )
+
+            results.append({
+                'hs4': cand.hs4,
+                'features_dict': features.to_dict(),
+                'feature_vector': features.to_vector(),
+                'feature_names': CandidateFeatures.feature_names(),
+            })
+
+        return results
+
+    def get_feature_importance_weights(self) -> Dict[str, float]:
+        """현재 피처 가중치 반환 (분석용)"""
+        return {
+            'weight_ml': self.weight_ml,
+            'weight_card': self.weight_card,
+            'weight_rule': self.weight_rule,
+            'weight_specificity': self.weight_specificity,
+            'weight_attr_match': self.weight_attr_match,
+            'weight_object': self.weight_object,
+            'weight_material': self.weight_material,
+            'weight_processing': self.weight_processing,
+            'weight_function': self.weight_function,
+            'weight_form': self.weight_form,
+            'weight_completeness': self.weight_completeness,
+            'weight_quant': self.weight_quant,
+            'weight_legal': self.weight_legal,
+            'exclude_penalty': self.exclude_penalty,
+            'hard_exclude_penalty': self.hard_exclude_penalty,
+            'parts_penalty': self.parts_penalty,
+        }
+
+
 # 테스트
 if __name__ == "__main__":
     reranker = HSReranker()
