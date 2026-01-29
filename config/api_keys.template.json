@@ -1,0 +1,5 @@
+{
+  "customs_api_key": "YOUR_API_KEY_HERE",
+  "_comment": "data.go.kr에서 발급받은 API 키를 입력하세요",
+  "_guide": "https://www.data.go.kr/data/15100432/openapi.do"
+}

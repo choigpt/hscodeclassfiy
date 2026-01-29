@@ -1,0 +1,46 @@
+# HSK 품목분류 시스템 - Python Dependencies
+
+# Database
+psycopg2-binary>=2.9.9  # PostgreSQL adapter
+
+# Data processing
+pandas>=2.1.0
+openpyxl>=3.1.2  # Excel 파일 읽기
+
+# AI/ML (Optional - RAG 사용 시)
+openai>=1.10.0  # OpenAI API
+anthropic>=0.18.0  # Claude API (선택)
+
+# Deep Learning (for Ranking Model)
+torch>=2.1.0  # PyTorch
+transformers>=4.36.0  # HuggingFace Transformers
+sentence-transformers>=2.2.2  # Sentence embeddings
+scikit-learn>=1.3.0  # Metrics
+
+# ML Baseline (Phase 1)
+xgboost>=2.0.0  # Gradient boosting
+numpy>=1.24.0
+matplotlib>=3.7.0  # Visualization
+seaborn>=0.12.0  # Statistical plots
+joblib>=1.3.0  # Model persistence
+
+# Vector search (Optional - pgvector 사용 시)
+# pgvector>=0.2.4
+
+# Web API (Optional - REST API 구축 시)
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+
+# Utilities
+python-dotenv>=1.0.0  # 환경 변수 관리
+requests>=2.31.0
+tqdm>=4.66.0  # Progress bar
+pyyaml>=6.0.1  # YAML 설정 파일
+
+# Testing (Optional)
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# Monitoring (Optional)
+# sentry-sdk>=1.40.0

@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code (AI assistant cache/settings)
+.claude/
+
+# Environment variables (보안: API 키 등)
+.env
+.env.local
+.env.*
+*.key
+*.pem
+credentials.json
+secrets.json
+config/api_keys.json
+
+# Data files (개인정보 보호)
+*.xlsx
+*.xls
+*.csv
+data/
+raw_data/
+
+# Large document files (대용량 문서)
+*.pdf
+*.docx
+*.doc
+
+# Model artifacts (생성된 모델/결과물)
+artifacts/
+models/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Database dumps
+*.sql.gz
+*.dump
+backups/
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+Thumbs.db
+nul
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
