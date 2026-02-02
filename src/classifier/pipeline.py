@@ -13,12 +13,14 @@ import sys
 from pathlib import Path
 from typing import Optional, Dict, Set, List, Any
 
-from .types import ClassificationResult, Candidate
+from .types import ClassificationResult, Candidate, DecisionStatus, StageInfo
 from .retriever import HSRetriever
 from .reranker import HSReranker
 from .clarify import HSClarifier
 from .gri_signals import GRISignals, detect_gri_signals, detect_parts_signal
 from .attribute_extract import GlobalAttributes, extract_attributes
+from .legal_gate import LegalGate
+from .fact_checker import FactSufficiencyChecker
 
 
 class HSPipeline:
@@ -31,6 +33,7 @@ class HSPipeline:
 
     Ablation 토글 파라미터:
     - use_gri: GRI 신호 탐지 사용 여부
+    - use_legal_gate: LegalGate (GRI 1) 사용 여부
     - use_8axis: 8축 전역 속성 사용 여부
     - use_rules: KB 규칙 매칭 사용 여부
     - use_ranker: LightGBM ranker 사용 여부
@@ -47,6 +50,7 @@ class HSPipeline:
         ranker_model_path: Optional[str] = None,
         # Ablation 토글 파라미터
         use_gri: bool = True,
+        use_legal_gate: bool = True,
         use_8axis: bool = True,
         use_rules: bool = True,
         use_ranker: bool = True,
@@ -55,12 +59,15 @@ class HSPipeline:
         self.retriever = retriever or HSRetriever()
         self.reranker = reranker or HSReranker()
         self.clarifier = clarifier or HSClarifier()
+        self.legal_gate = LegalGate() if use_legal_gate else None
+        self.fact_checker = FactSufficiencyChecker() if use_legal_gate else None  # FactCheck는 LegalGate와 함께 사용
 
         self.ml_topk = ml_topk
         self.kb_topk = kb_topk
 
         # Ablation 토글 설정
         self.use_gri = use_gri
+        self.use_legal_gate = use_legal_gate
         self.use_8axis = use_8axis
         self.use_rules = use_rules
         self.use_ranker = use_ranker
@@ -207,6 +214,7 @@ class HSPipeline:
         debug['attrs_summary'] = input_attrs.summary()
         debug['ablation'] = {
             'use_gri': self.use_gri,
+            'use_legal_gate': self.use_legal_gate,
             'use_8axis': self.use_8axis,
             'use_rules': self.use_rules,
             'use_ranker': self.use_ranker,
@@ -266,23 +274,86 @@ class HSPipeline:
         if not_in_model_list:
             debug['not_in_model_hs4'] = not_in_model_list
 
+        # Step 3.5: LegalGate (GRI 1 기반 법적 필터링) - Ablation 토글
+        if self.use_legal_gate and self.legal_gate:
+            candidates, redirect_hs4s, legal_gate_debug = self.legal_gate.apply(text, candidates)
+            debug['legal_gate'] = legal_gate_debug
+
+            # 리다이렉트 HS4 추가 (새로운 후보)
+            if redirect_hs4s:
+                for rhs4 in redirect_hs4s:
+                    # 간단한 Candidate 생성 (reranker에서 점수 계산)
+                    from .types import Evidence
+                    redirect_cand = Candidate(
+                        hs4=rhs4,
+                        score_ml=0.0,
+                        evidence=[Evidence(
+                            kind="legal_redirect",
+                            source_id=rhs4,
+                            text=f"주규정에 의한 리다이렉트: 제{rhs4}호",
+                            weight=0.8
+                        )]
+                    )
+                    candidates.append(redirect_cand)
+
+            debug['after_legal_gate_count'] = len(candidates)
+
+            # LegalGate 통과 후 후보가 1개면 즉시 반환 (GRI 1로 확정)
+            if len(candidates) == 1:
+                single_cand = candidates[0]
+                single_cand.score_total = 1.0
+                single_cand.features['gri1_definitive'] = True
+                debug['gri1_single_candidate'] = True
+                debug['gri_decision'] = 'GRI 1 - 단일 호로 확정'
+                return ClassificationResult(
+                    input_text=text,
+                    topk=[single_cand],
+                    low_confidence=False,
+                    questions=[],
+                    debug=debug
+                )
+            elif len(candidates) == 0:
+                # LegalGate에서 모든 후보가 제외됨 → 질문 필요
+                debug['gri1_all_excluded'] = True
+                debug['gri_decision'] = 'GRI 1 - 모든 후보 제외됨'
+                return ClassificationResult(
+                    input_text=text,
+                    topk=[],
+                    low_confidence=True,
+                    questions=["입력 정보로는 분류할 수 없습니다. 추가 정보를 제공해주세요."],
+                    debug=debug
+                )
+            else:
+                # 복수 후보가 남음 → GRI 2/3/5 적용
+                debug['gri_decision'] = f'GRI 1 불충분 ({len(candidates)}개 후보) → GRI 2/3/5 적용'
+
         # Step 4: Rerank (GRI + 속성 피처 포함) - Ablation 토글
+        # GRI 2/3/5는 LegalGate 통과 후 복수 후보가 남은 경우에만 활성화
         # 8축 속성은 use_8axis 플래그에 따라 전달
         input_attrs_8axis = None
         if self.use_8axis:
             from .attribute_extract import extract_attributes_8axis
             input_attrs_8axis = extract_attributes_8axis(text)
 
+        # GRI 2/3/5 적용 여부 결정
+        # - LegalGate를 사용하지 않거나
+        # - LegalGate 통과 후 복수 후보가 남은 경우에만 GRI 2/3/5 적용
+        apply_gri_235 = (
+            not self.use_legal_gate or
+            (self.use_legal_gate and len(candidates) > 1)
+        )
+
         reranked, rerank_stats = self.reranker.rerank(
             text,
             candidates,
             topk=topk,
-            gri_signals=gri_signals if self.use_gri else None,
+            gri_signals=gri_signals if (self.use_gri and apply_gri_235) else None,
             input_attrs=input_attrs,
             input_attrs_8axis=input_attrs_8axis,
             model_classes=model_classes,
             ranker_model=self.ranker_model if self.use_ranker else None
         )
+        rerank_stats['gri_235_applied'] = apply_gri_235
         debug['rerank_stats'] = rerank_stats
         debug['reranked_top5'] = [
             {
