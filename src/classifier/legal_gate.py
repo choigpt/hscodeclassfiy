@@ -71,8 +71,57 @@ class LegalGate:
         self.notes_loader = notes_loader or get_notes_loader()
 
         # KB 카드 데이터 (호 용어 매칭용)
-        # TODO: retriever에서 카드 데이터 가져오기
-        self.heading_terms: Dict[str, List[str]] = {}
+        self.heading_terms = self._load_heading_terms()
+        print(f"[LegalGate] Heading terms loaded: {len(self.heading_terms)} HS4")
+
+    def _load_heading_terms(self) -> Dict[str, List[str]]:
+        """HS4 호 용어 로드 (title_ko + scope 토큰)"""
+        from pathlib import Path
+        import json
+
+        heading_terms = {}
+        cards_path = Path("kb/structured/hs4_cards.jsonl")
+
+        if not cards_path.exists():
+            return heading_terms
+
+        with open(cards_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+
+                try:
+                    card = json.loads(line)
+                    hs4 = card.get('hs4')
+                    if not hs4:
+                        continue
+
+                    terms = []
+
+                    # Title (heading)
+                    title = card.get('title_ko', '')
+                    if title:
+                        # 정규화 및 토큰화
+                        title_norm = normalize(title)
+                        title_tokens = [t for t in title_norm.split() if len(t) >= 2]
+                        terms.extend(title_tokens)
+
+                    # Scope (keywords)
+                    scope = card.get('scope', [])
+                    if scope:
+                        for keyword in scope:
+                            kw_norm = normalize(keyword)
+                            kw_tokens = [t for t in kw_norm.split() if len(t) >= 2]
+                            terms.extend(kw_tokens)
+
+                    # 중복 제거
+                    if terms:
+                        heading_terms[hs4] = list(set(terms))
+
+                except Exception:
+                    continue
+
+        return heading_terms
 
     def apply(
         self,
@@ -167,6 +216,18 @@ class LegalGate:
         existing_hs4s = {c.hs4 for c in passed_candidates}
         new_redirect_hs4s = [h for h in redirect_targets if h not in existing_hs4s]
 
+        # Per-candidate results를 debug에 포함 (ranker 학습용)
+        results_dict = {}
+        for hs4, result in results.items():
+            results_dict[hs4] = {
+                'passed': result.passed,
+                'heading_term_score': result.heading_term_score,
+                'include_support_score': result.include_support_score,
+                'exclude_conflict_score': result.exclude_conflict_score,
+                'redirect_penalty': result.redirect_penalty,
+                'total_score': result.total_score(),
+            }
+
         debug = {
             'legal_gate_applied': True,
             'total_evaluated': len(candidates),
@@ -177,6 +238,7 @@ class LegalGate:
             'redirects_added': len(new_redirect_hs4s),
             'redirect_hs4s': new_redirect_hs4s,
             'pass_rate': len(passed_candidates) / len(candidates) if candidates else 0,
+            'results': results_dict,  # Per-candidate results 추가
         }
 
         return passed_candidates, new_redirect_hs4s, debug
@@ -198,8 +260,33 @@ class LegalGate:
             return result
 
         # 1. Heading term match (호 용어 매칭)
-        # TODO: KB 카드에서 heading term 가져오기
-        # 현재는 생략
+        if hs4 in self.heading_terms:
+            terms = self.heading_terms[hs4]
+            matched_terms = []
+
+            for term in terms:
+                if simple_contains(input_norm, term):
+                    # 직접 매칭: 0.1점
+                    result.heading_term_score += 0.1
+                    matched_terms.append(term)
+                else:
+                    # Fuzzy 매칭: 0.05점
+                    match_result, _ = fuzzy_match(input_norm, term)
+                    if match_result:
+                        result.heading_term_score += 0.05
+                        matched_terms.append(f"~{term}")
+
+            # 점수 클리핑 (최대 1.0)
+            result.heading_term_score = min(result.heading_term_score, 1.0)
+
+            # 증거 추가
+            if matched_terms:
+                result.evidence.append(Evidence(
+                    kind='legal_heading_term',
+                    source_id=hs4,
+                    text=f"호 용어 매칭: {', '.join(matched_terms[:5])}",
+                    weight=result.heading_term_score
+                ))
 
         # 2. Include support (포함 주규정 지지도)
         include_notes = note_index.include_notes()

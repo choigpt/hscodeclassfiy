@@ -56,7 +56,8 @@ class HSPipeline:
         use_ranker: bool = True,
         use_questions: bool = True
     ):
-        self.retriever = retriever or HSRetriever()
+        # KB-only 모드 지원: retriever=None 허용 (fallback 생성 금지)
+        self.retriever = retriever
         self.reranker = reranker or HSReranker()
         self.clarifier = clarifier or HSClarifier()
         self.legal_gate = LegalGate() if use_legal_gate else None
@@ -96,7 +97,11 @@ class HSPipeline:
     def get_model_classes(self) -> Set[str]:
         """모델이 알고 있는 HS4 집합"""
         if self._model_classes is None:
-            self._model_classes = self.retriever.get_model_classes()
+            if self.retriever:
+                self._model_classes = self.retriever.get_model_classes()
+            else:
+                # KB-only 모드: 빈 set 반환
+                self._model_classes = set()
         return self._model_classes
 
     def get_kb_classes(self) -> Set[str]:
@@ -140,41 +145,64 @@ class HSPipeline:
     def _merge_candidates(
         self,
         ml_candidates: List[Candidate],
-        kb_candidates: List[Candidate]
+        kb_candidates: List[Candidate],
+        merge_debug: dict
     ) -> List[Candidate]:
         """
-        ML + KB 후보 합집합
+        KB + ML 후보 합집합 (KB-first 전략)
 
         Args:
             ml_candidates: ML 기반 후보
             kb_candidates: KB 기반 후보
+            merge_debug: 병합 통계 기록용 dict
 
         Returns:
-            합집합 (중복 제거, ML 우선)
+            합집합 (중복 제거, KB 우선 + ML 보강)
         """
         seen_hs4 = set()
         merged = []
 
-        # ML 후보 먼저
-        for c in ml_candidates:
-            if c.hs4 not in seen_hs4:
-                seen_hs4.add(c.hs4)
-                merged.append(c)
-
-        # KB 후보 추가 (ML에 없는 것만)
+        # [변경] KB 후보 먼저 (KB-first strategy)
+        kb_only_count = 0
         for c in kb_candidates:
             if c.hs4 not in seen_hs4:
                 seen_hs4.add(c.hs4)
-                # KB 전용 후보임을 evidence에 표시
+                c.features['source'] = 'kb'  # Track source
+                merged.append(c)
+                kb_only_count += 1
+
+        # ML 후보 추가 (KB에 없는 것만 - recall 보강)
+        ml_only_count = 0
+        intersection_count = 0
+        for c in ml_candidates:
+            if c.hs4 in seen_hs4:
+                intersection_count += 1
+                # KB와 ML 모두에 있는 후보: ML score를 KB 후보에 추가
+                for kb_cand in merged:
+                    if kb_cand.hs4 == c.hs4:
+                        kb_cand.score_ml = c.score_ml
+                        kb_cand.features['source'] = 'kb+ml'
+                        break
+            else:
+                seen_hs4.add(c.hs4)
+                c.features['source'] = 'ml'
+                # ML 전용 후보임을 evidence에 표시
                 from .types import Evidence
                 c.evidence.insert(0, Evidence(
-                    kind="kb_only",
+                    kind="ml_only",
                     source_id=c.hs4,
-                    text="ML 모델에 없는 HS4 (KB에서 추가)",
+                    text="KB에 없는 후보 (ML로 보강)",
                     weight=0.1,
-                    meta={'not_in_model': True}
+                    meta={'ml_recall': True}
                 ))
                 merged.append(c)
+                ml_only_count += 1
+
+        # 병합 통계 기록
+        merge_debug['kb_only_count'] = kb_only_count
+        merge_debug['ml_only_count'] = ml_only_count
+        merge_debug['intersection_count'] = intersection_count
+        merge_debug['total_merged'] = len(merged)
 
         return merged
 
@@ -223,7 +251,7 @@ class HSPipeline:
 
         # Step 1: ML Top-K 후보 생성
         ml_candidates = []
-        if self.retriever.is_ready():
+        if self.retriever and self.retriever.is_ready():
             ml_candidates = self.retriever.predict_topk(text, k=self.ml_topk)
 
         debug['ml_candidates_count'] = len(ml_candidates)
@@ -231,6 +259,7 @@ class HSPipeline:
             {'hs4': c.hs4, 'score_ml': round(c.score_ml, 4)}
             for c in ml_candidates[:5]
         ]
+        debug['ml_used'] = bool(self.retriever and ml_candidates)
 
         # Step 2: KB 후보 생성 (GRI + 속성 기반 조정) - Ablation 토글
         kb_candidates = []
@@ -261,9 +290,68 @@ class HSPipeline:
             for c in kb_candidates[:5]
         ]
 
-        # Step 3: 합집합
-        candidates = self._merge_candidates(ml_candidates, kb_candidates)
+        # Step 3: 합집합 (KB-first + ML recall)
+        merge_debug = {}
+        candidates = self._merge_candidates(ml_candidates, kb_candidates, merge_debug)
         debug['merged_candidates_count'] = len(candidates)
+        debug['merge_stats'] = merge_debug
+
+        # KB confidence gate 계산 (rerank 전 pre-score 기반)
+        kb_margin = 0.0
+        kb_locked = False
+        kb_top1_hs4 = None
+        kb_top1_card_count = 0
+
+        if len(kb_candidates) >= 2:
+            # KB top1과 top2의 KB score로 confidence 판단
+            kb_top1 = kb_candidates[0]
+            kb_top2 = kb_candidates[1]
+            kb_top1_hs4 = kb_top1.hs4
+
+            # KB retrieval evidence의 meta에서 kb_score 가져오기
+            kb_top1_score = 0.0
+            kb_top2_score = 0.0
+            for ev in kb_top1.evidence:
+                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
+                    kb_top1_score = ev.meta['kb_score']
+                    break
+            for ev in kb_top2.evidence:
+                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
+                    kb_top2_score = ev.meta['kb_score']
+                    break
+
+            # KB score 차이
+            kb_margin = kb_top1_score - kb_top2_score
+            kb_top1_card_count = int(kb_top1_score)  # For debug logging
+
+            # Lock 조건: KB top1 score >= 10.0 AND top2보다 3.0 이상 높음
+            KB_SCORE_THRESHOLD = 10.0
+            KB_MARGIN_THRESHOLD = 3.0
+            if kb_top1_score >= KB_SCORE_THRESHOLD and kb_margin >= KB_MARGIN_THRESHOLD:
+                kb_locked = True
+
+        elif len(kb_candidates) == 1:
+            # KB 후보가 1개만 있으면 그것의 score로 판단
+            kb_top1_hs4 = kb_candidates[0].hs4
+            kb_top1_score = 0.0
+            for ev in kb_candidates[0].evidence:
+                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
+                    kb_top1_score = ev.meta['kb_score']
+                    break
+            kb_margin = kb_top1_score
+            kb_top1_card_count = int(kb_top1_score)  # For debug logging
+            # Single KB candidate: lock if score >= 15.0 (very high confidence)
+            if kb_top1_score >= 15.0:
+                kb_locked = True  # 단독이므로 margin = card count
+
+        debug['kb_margin'] = round(kb_margin, 2)
+        debug['kb_locked'] = kb_locked
+        debug['kb_top1_hs4'] = kb_top1_hs4
+        debug['kb_top1_card_count'] = kb_top1_card_count
+        # Debug: show card counts for top2 as well
+        if len(kb_candidates) >= 2:
+            kb_top2_card_count_debug = sum(1 for ev in kb_candidates[1].evidence if ev.kind in ['card_keyword', 'card_exact'])
+            debug['kb_top2_card_count'] = kb_top2_card_count_debug
 
         # not_in_model 표시
         model_classes = self.get_model_classes()
@@ -308,7 +396,7 @@ class HSPipeline:
                 return ClassificationResult(
                     input_text=text,
                     topk=[single_cand],
-                    low_confidence=False,
+                    decision=DecisionStatus(status="AUTO", reason="GRI 1 - 단일 호로 확정", confidence=1.0),
                     questions=[],
                     debug=debug
                 )
@@ -319,7 +407,7 @@ class HSPipeline:
                 return ClassificationResult(
                     input_text=text,
                     topk=[],
-                    low_confidence=True,
+                    decision=DecisionStatus(status="ASK", reason="GRI 1 - 모든 후보 제외됨", confidence=0.0),
                     questions=["입력 정보로는 분류할 수 없습니다. 추가 정보를 제공해주세요."],
                     debug=debug
                 )
@@ -343,6 +431,42 @@ class HSPipeline:
             (self.use_legal_gate and len(candidates) > 1)
         )
 
+        # Conditional ML weight 계산
+        # ML을 강하게 사용할 조건: short text, fact insufficient, ambiguous
+        w_ml = 0.2  # 기본 낮은 가중치
+        use_strong_ml = False
+
+        # 조건 1: 텍스트가 짧음 (< 20자)
+        if len(text) < 20:
+            w_ml = 0.4
+            use_strong_ml = True
+
+        # 조건 2: Fact insufficient (질문 생성이 필요한 경우)
+        if debug.get('questions_generated_count', 0) > 0:
+            w_ml = 0.5
+            use_strong_ml = True
+
+        # 조건 3: KB 후보가 너무 적음 (< 5개)
+        if len(kb_candidates) < 5:
+            w_ml = 0.4
+            use_strong_ml = True
+
+        # 조건 4: KB locked - ML을 더 약하게
+        if kb_locked:
+            w_ml = 0.05  # KB가 확신있으면 ML 거의 무시
+            use_strong_ml = False
+
+        debug['w_ml'] = round(w_ml, 2)
+        debug['use_strong_ml'] = use_strong_ml
+
+        # ML weight를 candidates에 적용 (score_ml에 가중치)
+        for cand in candidates:
+            if hasattr(cand, 'score_ml') and cand.score_ml > 0:
+                cand.features['w_ml'] = w_ml
+                # score_ml을 가중치 적용한 값으로 조정 (reranker에서 사용)
+                cand.features['weighted_ml_score'] = cand.score_ml * w_ml
+
+        ranker_model_to_use = self.ranker_model if self.use_ranker else None
         reranked, rerank_stats = self.reranker.rerank(
             text,
             candidates,
@@ -351,9 +475,43 @@ class HSPipeline:
             input_attrs=input_attrs,
             input_attrs_8axis=input_attrs_8axis,
             model_classes=model_classes,
-            ranker_model=self.ranker_model if self.use_ranker else None
+            ranker_model=ranker_model_to_use
         )
         rerank_stats['gri_235_applied'] = apply_gri_235
+
+        # KB lock 적용: KB top1이 locked이면 최종 top1을 강제로 kb_top1으로
+        top1_source = "ranker"
+        if kb_locked and kb_top1_hs4:
+            # reranked에서 kb_top1_hs4 찾기
+            kb_top1_in_reranked = None
+            kb_top1_rank = -1
+            for i, cand in enumerate(reranked):
+                if cand.hs4 == kb_top1_hs4:
+                    kb_top1_in_reranked = cand
+                    kb_top1_rank = i
+                    break
+
+            # KB top1이 reranked top-5 안에 있으면 top1으로 이동
+            if kb_top1_in_reranked and kb_top1_rank < 10:  # top-10 이내만 override
+                # kb_top1을 맨 앞으로
+                reranked.remove(kb_top1_in_reranked)
+                reranked.insert(0, kb_top1_in_reranked)
+                top1_source = "kb_locked"
+                debug['kb_lock_applied'] = True
+                debug['kb_top1_original_rank'] = kb_top1_rank
+
+        debug['top1_source'] = top1_source
+
+        # Retriever 사용 여부 명시적 기록
+        debug['retriever_used'] = debug.get('ml_used', False)  # ML 후보 생성 여부
+
+        # Ranker 사용 여부 명시적 기록 (3-level tracking)
+        debug['use_ranker'] = self.use_ranker  # Config: ranker 활성화 여부
+        debug['ranker_loaded'] = bool(self.ranker_model)  # Model: 모델 로드 성공 여부
+        debug['ranker_applied'] = (self.use_ranker and bool(self.ranker_model) and len(candidates) > 0)  # Actual: 실제 적용 여부
+        # Backward compatibility
+        debug['ranker_used'] = debug['ranker_applied']
+
         debug['rerank_stats'] = rerank_stats
         debug['reranked_top5'] = [
             {
@@ -397,10 +555,20 @@ class HSPipeline:
                 max_questions=3
             )
 
+        # Decision 생성
+        if low_confidence:
+            status = "ASK"
+            reason = "저신뢰도"
+            confidence = scores[0] if scores else 0.0
+        else:
+            status = "AUTO"
+            reason = "정상 분류"
+            confidence = scores[0] if scores else 0.0
+
         return ClassificationResult(
             input_text=text,
             topk=reranked,
-            low_confidence=low_confidence,
+            decision=DecisionStatus(status=status, reason=reason, confidence=confidence),
             questions=questions,
             debug=debug
         )

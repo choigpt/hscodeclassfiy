@@ -13,6 +13,7 @@ import numpy as np
 from ..gri_signals import detect_gri_signals
 from ..reranker import HSReranker, CandidateFeatures
 from ..types import Candidate
+from ..attribute_extract import extract_attributes, extract_attributes_8axis
 
 
 def build_rank_dataset(
@@ -97,6 +98,10 @@ def build_rank_dataset(
         # GRI 신호 탐지
         gri_signals = detect_gri_signals(product_name)
 
+        # 전역 속성 추출
+        input_attrs = extract_attributes(product_name)
+        input_attrs_8axis = extract_attributes_8axis(product_name)
+
         # KB 후보 생성
         kb_candidates = reranker.retrieve_from_kb(
             product_name,
@@ -127,7 +132,9 @@ def build_rank_dataset(
                 product_name,
                 cand,
                 gri_signals,
-                model_classes=None  # 모델 클래스는 나중에 추가 가능
+                input_attrs=input_attrs,
+                model_classes=None,  # 모델 클래스는 나중에 추가 가능
+                input_attrs_8axis=input_attrs_8axis
             )
 
             label = 1 if cand.hs4 == hs_heading else 0
