@@ -223,15 +223,64 @@ python -m src.experiments.run_benchmark --ablation P5_plus_ranker
 
 ---
 
-## 7. 한계 및 향후 연구
+## 7. LightGBM Ranker 학습 검증 (2026-02-08)
 
-### 7.1 현재 한계
+### 7.1 f_lexical 정규화
+
+**변경**: `reranker.py`에서 kb_score를 `log1p(x)/log1p(30)` + clamp(1.0)으로 [0,1] 정규화
+
+**검증 결과**:
+- CSV 반영 확인: raw [0, 39] mean=2.80 → normalized [0, 1.0] mean=0.354
+- **LightGBM gain 불변**: tree-based 모델은 단조 변환(monotonic transform)에 불변
+  - 동일한 분할 경계 선택 → gain, NDCG, accuracy 모두 동일
+- **Fallback weighted-score 경로 수정됨**: max 기여 5.85 → 0.15
+
+### 7.2 Metric 정의 검증
+
+- **Top-K Accuracy**: query별 정답 HS4가 예측 top-K에 포함되는 비율 (HS4 분류 정확도)
+- candidate recall@K가 아닌 **분류 정확도**임을 확인
+- 평가 단위: query = 결정사례 1건, label=1 if HS4 matches ground truth
+
+### 7.3 Train/Test Leakage
+
+| Item | Value |
+|------|-------|
+| Train queries | 5,757 |
+| Test queries | 1,439 |
+| Text overlap (exact match) | 48건 (3.4%) |
+| Severity | Low (동일 품명, 다른 결정사례, query_id 분리) |
+
+### 7.4 Feature Importance
+
+| Rank | Feature | Gain | Ratio |
+|------|---------|------|-------|
+| 1 | f_lexical | 251,890 | 86.8% |
+| 2 | f_specificity | 5,435 | 1.9% |
+| 3 | f_form_match_score | 5,122 | 1.8% |
+| 4 | f_material_match_score | 4,975 | 1.7% |
+| 5 | f_card_hits | 3,307 | 1.1% |
+
+### 7.5 Dominance 완화 실험
+
+| | Baseline | Exp A (no f_lexical) | Exp B (regularized) |
+|---|----------|---------------------|---------------------|
+| Test Top-1 | 0.7661 | 0.3894 | 0.7703 |
+| NDCG@5 | 0.8716 | 0.3079 | 0.8691 |
+| f_lexical ratio | 86.8% | N/A | 86.3% |
+
+**결론**: f_lexical은 정보량 자체가 지배적 (제거시 NDCG@5 0.59 drop). 단조 변환/파라미터 튜닝으로 해소 불가. `feature_interaction_constraints`, 2-stage ranker, `max_bin` 축소 등 구조적 접근 필요.
+
+---
+
+## 8. 한계 및 향후 연구
+
+### 8.1 현재 한계
 
 1. **데이터 의존성**: 결정사례 데이터 품질에 의존
 2. **언어 제한**: 한국어 품명만 지원
 3. **실시간 처리**: SBert 임베딩 비용
 
-### 7.2 향후 연구 방향
+### 8.2 향후 연구 방향
 
 1. 다국어 확장 (영어, 중국어)
 2. Few-shot/Zero-shot HS 분류

@@ -136,6 +136,14 @@ class EvalRunner:
                 use_ranker=True,  # Ranker ON
                 use_questions=True
             )
+        elif self.mode == 'rag':
+            # RAG 모드: BM25+SBERT 검색 + Ollama LLM
+            print("[RAG 모드] BM25+SBERT 하이브리드 검색 + Ollama LLM 파이프라인")
+            from src.rag.eval_adapter import RAGPipelineAdapter
+            self._rag_adapter = RAGPipelineAdapter()
+            # rag 모드는 HSPipeline이 아닌 RAGPipelineAdapter를 사용
+            # 호환을 위해 pipeline에 할당 (classify 인터페이스 동일)
+            return self._rag_adapter
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -270,7 +278,9 @@ class EvalRunner:
             debug = result.debug
 
             # retriever_used/ranker_used 검증
-            retriever_used = debug.get('ml_used', False) or (self.pipeline.retriever is not None)
+            retriever_used = debug.get('ml_used', False) or (
+                hasattr(self.pipeline, 'retriever') and self.pipeline.retriever is not None
+            )
             ranker_used = debug.get('ranker_applied', False)
 
             # kb_only 모드에서 ranker_used=True면 에러
@@ -398,6 +408,18 @@ class EvalRunner:
 
             print(f"  [PASS] KB-only 모드: ML retriever/ranker 사용 없음")
 
+        # RAG 모드 검증
+        elif self.mode == 'rag':
+            # RAG 모드: retriever/ranker 사용 없음 (rag_mode=True 확인)
+            rag_mode_count = sum(
+                1 for p in predictions
+                if p.get('debug', {}).get('rag_mode', False)
+            )
+            if rag_mode_count == 0:
+                print(f"  [WARNING] rag_mode=True가 없음. RAG 파이프라인 확인 필요.")
+            else:
+                print(f"  [PASS] RAG 모드: {rag_mode_count}/{total} samples")
+
         # Hybrid 모드 검증
         elif self.mode == 'hybrid':
             violations = []
@@ -496,10 +518,29 @@ class EvalRunner:
         auditor.save_audit(str(self.output_dir))
 
         # 6. 실험 설정 저장
-        # LegalGate heading_terms 길이 확인
-        heading_terms_len = 0
-        if self.pipeline.legal_gate and hasattr(self.pipeline.legal_gate, 'heading_terms'):
-            heading_terms_len = len(self.pipeline.legal_gate.heading_terms)
+        if self.mode == 'rag':
+            pipeline_config = {
+                'mode': 'rag',
+                'pipeline_type': 'RAGPipelineAdapter',
+            }
+        else:
+            # LegalGate heading_terms 길이 확인
+            heading_terms_len = 0
+            if self.pipeline.legal_gate and hasattr(self.pipeline.legal_gate, 'heading_terms'):
+                heading_terms_len = len(self.pipeline.legal_gate.heading_terms)
+            pipeline_config = {
+                'use_gri': self.pipeline.use_gri,
+                'use_legal_gate': self.pipeline.use_legal_gate,
+                'use_8axis': self.pipeline.use_8axis,
+                'use_rules': self.pipeline.use_rules,
+                'use_ranker': self.pipeline.use_ranker,
+                'use_questions': self.pipeline.use_questions,
+                'retriever_present': self.pipeline.retriever is not None,
+                'ranker_model_loaded': self.pipeline.ranker_model is not None,
+                'heading_terms_len': heading_terms_len,
+                'ml_topk': self.pipeline.ml_topk,
+                'kb_topk': self.pipeline.kb_topk,
+            }
 
         config = {
             'run_id': self.run_id,
@@ -511,20 +552,7 @@ class EvalRunner:
             'topk': self.topk,
             'dataset_path': dataset_path,
             'limit': limit,
-            'pipeline_config': {
-                'use_gri': self.pipeline.use_gri,
-                'use_legal_gate': self.pipeline.use_legal_gate,
-                'use_8axis': self.pipeline.use_8axis,
-                'use_rules': self.pipeline.use_rules,
-                'use_ranker': self.pipeline.use_ranker,
-                'use_questions': self.pipeline.use_questions,
-                # 추가: retriever/ranker 실제 상태
-                'retriever_present': self.pipeline.retriever is not None,
-                'ranker_model_loaded': self.pipeline.ranker_model is not None,
-                'heading_terms_len': heading_terms_len,
-                'ml_topk': self.pipeline.ml_topk,
-                'kb_topk': self.pipeline.kb_topk,
-            }
+            'pipeline_config': pipeline_config,
         }
 
         with open(self.output_dir / 'config.json', 'w', encoding='utf-8') as f:
@@ -562,13 +590,16 @@ Examples:
   # Seed 및 K 지정
   python -m src.classifier.eval.run_eval --mode hybrid --seed 42 --k 120
 
+  # RAG 모드 (BM25+SBERT+LLM)
+  python -m src.classifier.eval.run_eval --mode rag --limit 200
+
   # 샘플 제한 (smoke test)
   python -m src.classifier.eval.run_eval --mode kb_only --limit 200
         """
     )
 
-    parser.add_argument('--mode', choices=['kb_only', 'hybrid'], default='kb_only',
-                        help='평가 모드')
+    parser.add_argument('--mode', choices=['kb_only', 'hybrid', 'rag'], default='kb_only',
+                        help='평가 모드 (kb_only, hybrid, rag)')
     parser.add_argument('--dataset', default='data/ruling_cases/all_cases_full_v7.json',
                         help='데이터셋 경로')
     parser.add_argument('--seed', type=int, default=42,

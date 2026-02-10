@@ -335,8 +335,9 @@ Output: Top-5 + Decision (AUTO/ASK) + Questions
 |------|------|----------|
 | ML Retriever Fine-tuning | 🔧 필요 | **High** |
 | Confidence Calibration | 🔧 필요 | **High** |
+| f_lexical Dominance 구조적 해소 | 🔧 실험 완료, 구조적 접근 필요 | **High** |
 | Top-5 Recall 개선 | 🔧 필요 | Medium |
-| Feature Scaling 조정 | 🔧 필요 | Medium |
+| ~~Feature Scaling 조정~~ | ✅ 완료 (2026-02-08) | ~~Medium~~ |
 | API 서버 구현 | ⏸️ 대기 | Low |
 | UI/UX 개발 | ⏸️ 대기 | Low |
 
@@ -400,25 +401,29 @@ Output: Top-5 + Decision (AUTO/ASK) + Questions
 
 **예상 효과**: ECE 0.77 → 0.3 이하
 
-#### **Priority 3: Feature Importance Re-balancing**
+#### **Priority 3: Feature Importance Re-balancing** (2026-02-08 실험 완료)
 
 **현재 문제**:
-- `f_lexical` importance: 251,890
-- `f_legal_heading_term` importance: 281
-- Lexical feature가 너무 dominant (900배 차이)
+- `f_lexical` gain: 251,890 (86.8%) — 다른 38개 피처 합계보다 6.5배
+- Tree-based 모델은 monotonic transform에 불변 → log1p 정규화 무효
 
-**해결 방안**:
-1. **Heading Term Score 가중치 증가**
-   - 현재: `heading_term_score * 0.1`
-   - 개선: `heading_term_score * 0.5`
+**실험 결과** (2026-02-08):
+| 실험 | Test Top-1 | NDCG@5 | f_lexical ratio |
+|------|-----------|--------|-----------------|
+| Baseline | 0.7661 | 0.8716 | 86.8% |
+| Exp A: f_lexical 제거 | 0.3894 (-0.38) | 0.3079 (-0.56) | N/A |
+| Exp B: regularized (ff=0.7, md=6, mgs=0.5) | 0.7703 (+0.004) | 0.8691 (-0.003) | 86.3% |
 
-2. **Lexical Score 정규화**
-   - Log scaling: `log(1 + f_lexical)`
-   - Min-Max scaling
+**결론**:
+- f_lexical은 핵심 정보원 (제거시 catastrophic drop)
+- 정규화/파라미터 튜닝으로 dominance 해소 불가 (tree invariance)
+- Fallback weighted-score 경로는 정규화로 정상 수정됨 (max 기여 5.85 → 0.15)
 
-3. **Feature Group Balancing**
-   - Legal features vs Lexical features 그룹별 정규화
-   - Group-wise weight 조정
+**남은 해결 방안** (구조적 접근):
+1. **feature_interaction_constraints**: f_lexical 독립 그룹 분리
+2. **max_bin 축소** (f_lexical 전용): 분할 해상도 제한
+3. **2-stage ranker**: f_lexical 없이 1차 랭킹 → f_lexical로 보정
+4. **feature_fraction_bynode**: 노드 단위 피처 샘플링
 
 **예상 효과**: LegalGate 효과 증대, 법적 정합성 향상
 

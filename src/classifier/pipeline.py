@@ -418,14 +418,13 @@ class HSPipeline:
         # Step 4: Rerank (GRI + 속성 피처 포함) - Ablation 토글
         # GRI 2/3/5는 LegalGate 통과 후 복수 후보가 남은 경우에만 활성화
         # 8축 속성은 use_8axis 플래그에 따라 전달
+        # NOTE: 8축 추출을 w_ml 계산 전으로 이동 (fact-insufficient 판정에 필요)
         input_attrs_8axis = None
         if self.use_8axis:
             from .attribute_extract import extract_attributes_8axis
             input_attrs_8axis = extract_attributes_8axis(text)
 
         # GRI 2/3/5 적용 여부 결정
-        # - LegalGate를 사용하지 않거나
-        # - LegalGate 통과 후 복수 후보가 남은 경우에만 GRI 2/3/5 적용
         apply_gri_235 = (
             not self.use_legal_gate or
             (self.use_legal_gate and len(candidates) > 1)
@@ -441,17 +440,33 @@ class HSPipeline:
             w_ml = 0.4
             use_strong_ml = True
 
-        # 조건 2: Fact insufficient (질문 생성이 필요한 경우)
-        if debug.get('questions_generated_count', 0) > 0:
-            w_ml = 0.5
-            use_strong_ml = True
+        # 조건 2: Fact insufficient — 주요 8축 속성 누락 기반
+        # material, processing_state, function_use, completeness는
+        # HS 분류의 핵심 판별축. 이 중 2개 이상 누락되면 KB 키워드 매칭의
+        # 신뢰도가 급격히 떨어지므로 ML 통계 패턴으로 보완해야 한다.
+        # (기존 questions_generated_count 조건은 이 시점에서 미설정이라 dead code였음)
+        fact_insufficient = False
+        missing_axis_count = 0
+        if input_attrs_8axis is not None:
+            _key_axes = ['material', 'processing_state', 'function_use', 'completeness']
+            missing_axis_count = sum(
+                1 for ax_id in _key_axes
+                if not input_attrs_8axis.get_axis(ax_id).values
+            )
+            if missing_axis_count >= 2:
+                fact_insufficient = True
+                # 3개 이상 누락이면 ML을 더 강하게
+                w_ml = 0.6 if missing_axis_count >= 3 else 0.5
+                use_strong_ml = True
+        debug['fact_insufficient'] = fact_insufficient
+        debug['missing_axis_count'] = missing_axis_count
 
         # 조건 3: KB 후보가 너무 적음 (< 5개)
         if len(kb_candidates) < 5:
-            w_ml = 0.4
+            w_ml = max(w_ml, 0.4)
             use_strong_ml = True
 
-        # 조건 4: KB locked - ML을 더 약하게
+        # 조건 4: KB locked - ML을 더 약하게 (최종 override)
         if kb_locked:
             w_ml = 0.05  # KB가 확신있으면 ML 거의 무시
             use_strong_ml = False
@@ -467,10 +482,17 @@ class HSPipeline:
                 cand.features['weighted_ml_score'] = cand.score_ml * w_ml
 
         ranker_model_to_use = self.ranker_model if self.use_ranker else None
+
+        # KB lock 안정화: rerank를 넓은 풀(internal_topk)로 수행한 뒤
+        # KB lock 적용 후 최종 topk로 줄인다.
+        # 기존에는 topk=5로 rerank해서 KB top1이 top5 밖이면 lock 불가였음.
+        _INTERNAL_TOPK = 20
+        internal_topk = max(topk, _INTERNAL_TOPK)
+
         reranked, rerank_stats = self.reranker.rerank(
             text,
             candidates,
-            topk=topk,
+            topk=internal_topk,
             gri_signals=gri_signals if (self.use_gri and apply_gri_235) else None,
             input_attrs=input_attrs,
             input_attrs_8axis=input_attrs_8axis,
@@ -482,7 +504,7 @@ class HSPipeline:
         # KB lock 적용: KB top1이 locked이면 최종 top1을 강제로 kb_top1으로
         top1_source = "ranker"
         if kb_locked and kb_top1_hs4:
-            # reranked에서 kb_top1_hs4 찾기
+            # reranked(internal_topk=20)에서 kb_top1_hs4 찾기
             kb_top1_in_reranked = None
             kb_top1_rank = -1
             for i, cand in enumerate(reranked):
@@ -491,15 +513,16 @@ class HSPipeline:
                     kb_top1_rank = i
                     break
 
-            # KB top1이 reranked top-5 안에 있으면 top1으로 이동
-            if kb_top1_in_reranked and kb_top1_rank < 10:  # top-10 이내만 override
-                # kb_top1을 맨 앞으로
+            # 넓은 풀(20) 내에서 KB top1을 찾아 top1으로 이동
+            if kb_top1_in_reranked:
                 reranked.remove(kb_top1_in_reranked)
                 reranked.insert(0, kb_top1_in_reranked)
                 top1_source = "kb_locked"
                 debug['kb_lock_applied'] = True
                 debug['kb_top1_original_rank'] = kb_top1_rank
 
+        # 최종 topk로 잘라냄 (외부 인터페이스 유지)
+        reranked = reranked[:topk]
         debug['top1_source'] = top1_source
 
         # Retriever 사용 여부 명시적 기록

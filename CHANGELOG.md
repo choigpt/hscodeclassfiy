@@ -4,6 +4,69 @@
 
 ---
 
+## 2026-02-08: Pipeline 성능 개선 + LightGBM Ranker Sanity Check
+
+### 문제
+1. **f_lexical dominance**: kb_score(0~39)가 정규화 없이 LightGBM/fallback에 사용 → lexical feature가 gain 86.8% 독점
+2. **KB lock 불안정**: rerank pool=5로 좁아 KB top-1이 rerank 후 누락
+3. **Fact-insufficient 판정 미작동**: `questions_generated_count` 조건이 항상 0 (dead code)
+
+### 해결
+
+#### [1] f_lexical 정규화 (`reranker.py`)
+- `log1p(x)/log1p(30)` + clamp(1.0)으로 [0,1] 정규화
+- Fallback weighted-score: max 기여 5.85 → 0.15로 제한
+- **LightGBM path**: tree invariance로 gain 불변 (expected) → 구조적 접근 필요
+
+#### [2] KB lock 안정화 (`pipeline.py`)
+- Internal rerank topk: 5 → 20 확장
+- KB top-1을 넓은 pool에서 탐색 후 lock → 최종 trim to user topk
+
+#### [3] Fact-insufficient 로직 수정 (`pipeline.py`)
+- Dead code 제거 (`questions_generated_count`)
+- 8-axis 속성 추출을 w_ml 계산 전으로 이동
+- 핵심 4축 (material, processing_state, function_use, completeness) 중 2개+ 누락시 fact_insufficient
+
+### Ranker Sanity Check 결과
+
+#### Baseline (LightGBM, 39 features)
+| Metric | Train | Test |
+|--------|-------|------|
+| Top-1 Acc | 0.7907 | 0.7661 |
+| Top-5 Acc | 0.9466 | 0.9426 |
+| NDCG@5 | 0.8856 | 0.8716 |
+
+#### Dominance 완화 실험
+| | Baseline | Exp A (no f_lexical) | Exp B (regularized) |
+|---|----------|---------------------|---------------------|
+| Test Top-1 | 0.7661 | 0.3894 (-0.38) | 0.7703 (+0.004) |
+| Test Top-5 | 0.9426 | 0.7017 (-0.24) | 0.9356 (-0.007) |
+| NDCG@5 | 0.8716 | 0.3079 (-0.56) | 0.8691 (-0.003) |
+| f_lexical ratio | 86.8% | N/A | 86.3% |
+
+#### 핵심 발견
+- f_lexical 제거시 catastrophic drop → 진짜 핵심 정보원
+- 정규화/파라미터 튜닝으로 dominance 해소 불가 (tree invariance)
+- Train/test leakage: 48건 (3.4%), query_id 분리로 심각도 낮음
+
+### 파일 수정
+- `src/classifier/reranker.py`: f_lexical 정규화, fallback score 추가
+- `src/classifier/pipeline.py`: internal topk 확장, 8axis 이동, fact-insufficient 수정
+
+### 파일 추가
+- `scripts/train_ranker_and_sanity_check.py`: 학습 + sanity check + 실험 스크립트
+- `artifacts/20260208_*/sanity_report.md`: Feature importance 리포트 (v2)
+- `artifacts/20260208_*/metrics.json`: 실험 메트릭 JSON
+
+### 문서
+- `CHANGELOG.md`: 이 항목 추가
+- `README.md`: LightGBM Ranker 성능, 프로젝트 구조, 향후 계획 업데이트
+- `docs/METHODOLOGY.md`: Ranker 학습 검증 섹션 추가
+- `docs/PROJECT_SUMMARY_20260204.md`: 성능, 진행상태, Feature Rebalancing 업데이트
+- `artifacts/ranker_legal/ARCHITECTURE.md`: 정규화 및 실험 결과 반영
+
+---
+
 ## 2026-02-04: 프로젝트 종합 정리
 
 ### 추가
@@ -202,6 +265,7 @@
 
 | 문서 | 작성일 | 설명 |
 |------|--------|------|
+| sanity_report.md (v2) | 2026-02-08 | LightGBM Ranker feature importance + 실험 비교표 |
 | PROJECT_SUMMARY_20260204.md | 2026-02-04 | 프로젝트 종합 정리 (기능, 모델, 성능, 방향) |
 | MODE_SEPARATION_FIX_REPORT.md | 2026-02-03 | 모드 분리 검증 및 KB-first 전략 |
 | COMPARE_KB_ONLY_VS_HYBRID.md | 2026-02-03 | KB-only vs Hybrid 성능 비교 |
@@ -218,4 +282,4 @@
 
 ---
 
-**마지막 업데이트**: 2026-02-04
+**마지막 업데이트**: 2026-02-08

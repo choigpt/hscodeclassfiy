@@ -1061,9 +1061,14 @@ class HSReranker:
         # 기본 피처
         features.f_ml = candidate.score_ml
 
+        # kb_score 정규화: raw score는 키워드 hit 누적값(0~50+)으로 스케일이 커서
+        # LightGBM에서 lexical dominance를 유발함.
+        # log1p 압축 + [0,1] clipping으로 "retrieval strength 힌트" 수준으로 축소.
+        # log1p(30)≈3.43을 기준으로 정규화: score 0→0, 10→0.69, 20→0.88, 30→1.0
         for ev in candidate.evidence:
             if ev.kind == 'kb_retrieval':
-                features.f_lexical = ev.meta.get('kb_score', 0.0)
+                raw_kb = ev.meta.get('kb_score', 0.0)
+                features.f_lexical = min(math.log1p(raw_kb) / math.log1p(30.0), 1.0)
                 break
 
         # 카드/규칙 점수
@@ -1280,6 +1285,9 @@ class HSReranker:
             self.weight_legal * features.f_legal_scope_match_score
         )
         score += axis_bonus
+
+        # KB retrieval 강도 힌트 (정규화된 f_lexical, LightGBM과 동일 스케일)
+        score += 0.15 * features.f_lexical
 
         # Note support
         score += 0.1 * features.f_note_support_sum

@@ -18,17 +18,28 @@
 
 ---
 
-## 성능 (Test 200 samples)
+## 성능
+
+### End-to-End (Test 200 samples)
 
 | 모드 | Top-1 Acc | Top-5 Acc | 특징 |
 |------|-----------|-----------|------|
 | **KB-only** | 12.0% | 35.5% | ML 불사용, 설명 가능 |
 | **Hybrid** | **13.5%** | 19.0% | KB-first + ML recall |
 
-**최신 성과** (2026-02-03):
-- Hybrid가 KB-only 능가 (+1.5pp)
-- KB-first 전략으로 regressions 18% 감소
-- Improvements 500% 증가 (2 → 12 samples)
+### LightGBM Ranker (Test 1,428 queries)
+
+| Metric | Train | Test |
+|--------|-------|------|
+| Top-1 Acc | 0.7907 | **0.7661** |
+| Top-5 Acc | 0.9466 | **0.9426** |
+| NDCG@5 | 0.8856 | **0.8716** |
+
+**최신 성과** (2026-02-08):
+- f_lexical 정규화: fallback weighted-score 경로 수정 완료
+- KB lock 안정화: internal rerank pool 5 → 20 확장
+- Fact-insufficient 로직: 8-axis 기반 판정으로 교체
+- Feature dominance 분석: f_lexical gain 86.8% (tree invariance로 정규화 무효, 구조적 접근 필요)
 
 ---
 
@@ -134,6 +145,7 @@ HS/
 │
 ├── scripts/                     # 유틸리티
 │   ├── analyze_hybrid_regressions.py
+│   ├── train_ranker_and_sanity_check.py  # Ranker 학습 + sanity check
 │   ├── run_full_evaluation.py
 │   └── parse_tariff_notes_v2.py
 │
@@ -294,14 +306,21 @@ retriever.train_model(
 )
 ```
 
-### LightGBM Ranker 학습
+### LightGBM Ranker 학습 + Sanity Check
 
 ```bash
-python -m src.experiments.train_ranker \
-  --train-file data/benchmarks/hs4_train.jsonl \
-  --val-file data/benchmarks/hs4_val.jsonl \
-  --output artifacts/ranker_legal/
+# 기존 CSV 재사용 (f_lexical 정규화 적용, ~4분)
+python scripts/train_ranker_and_sanity_check.py
+
+# 데이터셋 처음부터 재구축 (~30분)
+python scripts/train_ranker_and_sanity_check.py --rebuild
 ```
+
+**출력물** (`artifacts/<timestamp>_ranker_sanity/`):
+- `sanity_report.md`: Feature importance + 실험 비교표
+- `metrics.json`: 전체 메트릭 JSON
+- `model.txt`: LightGBM 모델
+- `rank_features_normalized.csv`: 정규화된 학습 데이터
 
 ---
 
@@ -327,7 +346,9 @@ python -m src.experiments.train_ranker \
    - 목표: Top-5 recall 19% → 30%+
 2. **Confidence Calibration**: Temperature scaling
    - 목표: ECE 0.77 → 0.3 이하
-3. **Feature Rebalancing**: Legal features 가중치 조정
+3. **f_lexical Dominance 해소**: tree invariance 대응
+   - feature_interaction_constraints / 2-stage ranker / max_bin 축소
+   - 현재: 정규화/파라미터 튜닝 실험 완료 (효과 없음 확인)
 
 ### 중기 (3-6개월)
 1. HS6 (6-digit) 분류 확장
@@ -367,5 +388,5 @@ Issues 및 Pull Requests 환영합니다.
 
 ---
 
-**마지막 업데이트**: 2026-02-04
+**마지막 업데이트**: 2026-02-08
 **프로젝트 상태**: 성능 최적화 단계 (연구 → 프로토타입 → **최적화**)
