@@ -1,0 +1,73 @@
+# HS Classification - Stage Configuration
+
+defaults:
+  topk: 5
+  seed: 42
+  data_path: "data/ruling_cases/all_cases_full_v7.json"
+  output_dir: "artifacts/results"
+
+stages:
+  rule:
+    name: "Rule-Based"
+    stage_id: 1
+    use_legal_gate: true
+
+  ml:
+    name: "ML (SBERT+LR)"
+    stage_id: 2
+    st_model: "jhgan/ko-sroberta-multitask"
+    lr_path: "artifacts/classifier/model_lr.joblib"
+    le_path: "artifacts/classifier/label_encoder.joblib"
+
+  llm:
+    name: "NL/LLM (RAG)"
+    stage_id: 3
+    index_dir: "artifacts/rag_index"
+    ollama_base_url: "http://localhost:11434/v1"
+    ollama_model: "qwen2.5:7b"
+    top_k_retrieval: 20
+    top_k_context: 10
+    max_context_chars: 4000
+    temperature: 0.1
+
+  hybrid:
+    name: "Hybrid (ML+KB+Ranker)"
+    stage_id: 4
+    ml_topk: 50
+    kb_topk: 30
+    ranker_path: "artifacts/ranker_legal/model_legal.txt"
+    use_gri: true
+    use_legal_gate: true
+    use_8axis: true
+    use_ranker: true
+
+  cascade:
+    name: "Cascade (Hybrid+RAG)"
+    stage_id: 5
+    escalation_conf_threshold: 0.50
+    escalation_gap_threshold: 0.15
+    rag_min_confidence: 0.30
+    cross_validation_boost: 0.15
+
+# Escalation thresholds
+escalation:
+  confidence_threshold: 0.50
+  gap_threshold: 0.15
+  rag_min_confidence: 0.30
+
+# GRI 순차 오케스트레이터 설정
+gri_orchestrator:
+  essential_character:
+    weights:
+      core_function: 0.35
+      user_perception: 0.25
+      area_volume: 0.20
+      structural: 0.20
+  risk:
+    gap_threshold_high: 0.30
+    gap_threshold_med: 0.15
+    high_threshold: 5.0
+    med_threshold: 2.5
+  subheading:
+    kb_path: "kb/structured/hs6_subheadings.jsonl"
+    cases_path: "data/ruling_cases/normalized_cases_rule.jsonl"

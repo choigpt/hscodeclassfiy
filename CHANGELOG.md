@@ -4,6 +4,113 @@
 
 ---
 
+## 2026-02-20: GRI 순차 파이프라인 전면 구현
+
+### 개요
+기존 ML+KB 하이브리드 파이프라인을 **GRI 통칙 순차 적용 오케스트레이터**로 전면 교체.
+GRI 1→2→3→5→6 순차 적용, Essential Character 모듈, HS6 서브헤딩 분류, 리스크 평가,
+판결 정규화를 포함하는 6-Phase 구현.
+
+### Phase 1: 기반 타입 및 데이터 모델
+
+#### 구조화 입력 모델
+- `src/classifier/input_model.py` 신규: `ClassificationInput`, `MaterialInfo` 데이터클래스
+- 재질 구성비, 세트 여부, 전기 여부, 관할, HS 버전 등 구조화 입력 지원
+- `to_enriched_text()` 메서드로 기존 text-only 인터페이스와 호환
+
+#### 타입 확장
+- `src/classifier/types.py`: 6개 새 데이터클래스 추가
+  - `GRIApplication`: GRI 적용 이력 (gri_id, applied, candidates_before/after)
+  - `ECFactor`, `EssentialCharacterResult`: EC 4요소 판정 결과
+  - `RiskAssessment`: 리스크 등급 (LOW/MED/HIGH)
+  - `RuleReference`: 규칙 참조 (rule_id, source, hs_version)
+  - `CaseEvidence`: 판결 증거 (case_id, jurisdiction, decisive_reasoning)
+- `Candidate`에 `hs6: str` 필드 추가
+- `ClassificationResult`에 `applied_gri`, `essential_character`, `risk`, `rule_references`, `case_evidence` 추가
+
+#### Rule ID 마이그레이션
+- `scripts/migrate_rule_ids.py` 신규: 11,912개 규칙에 결정론적 rule_id 부여
+  - 포맷: `{hs4}_{chunk_type}_{sha256(text[:100])[:8]}`
+  - source 추론 (explanatory_note, include_rule, exclude_rule 등)
+  - hs_version: "2022"
+- `kb/structured/hs4_rule_chunks_v2.jsonl` 생성
+- `src/kb/rules.py`: v2 파일 우선 로드, rule_id/source/hs_version 저장
+- `src/classifier/reranker.py`: Evidence.meta에 rule_id 메타데이터 노출
+
+#### 판결 케이스 정규화
+- `scripts/normalize_cases.py` 신규: 7,198건 관세청 결정사례 구조화
+  - Mode A (규칙 기반): regex로 HS4/6/10, GRI, rejected codes, decisive reasoning 파싱
+  - Mode B (하이브리드): Mode A + Ollama LLM 보완 (저확신 케이스)
+  - 평균 확신도 0.842, GRI 정보 96.2% 추출 성공
+- `data/ruling_cases/normalized_cases_rule.jsonl` 생성
+- `data/ruling_cases/normalization_comparison.json` 생성
+
+### Phase 2: GRI 순차 오케스트레이터 (핵심)
+- `src/classifier/gri_orchestrator.py` 신규: `GRIOrchestrator` 클래스
+  - `classify()`: ML+KB 후보에 GRI 1→2→3→5→6 순차 적용
+  - `_apply_gri1()`: LegalGate 기반 hard exclude + redirect
+  - `_apply_gri2()`: 미완성(2a) + 혼합물(2b) 처리
+  - `_apply_gri3()`: 3(a) specificity → 3(b) Essential Character → 3(c) fallback
+  - `_apply_gri5()`: 용기/포장 → 내용물 기준 분류
+  - `_apply_gri6()`: HS4→HS6 서브헤딩 해소
+  - Rule reference 수집, Case evidence 연결
+- `src/classifier/pipeline.py`: 기존 post-merge 로직을 오케스트레이터 호출로 교체
+  - `classify_structured(input_data)` 메서드 추가
+
+### Phase 3: Essential Character (GRI 3b)
+- `src/classifier/essential_character.py` 신규: `EssentialCharacterModule`
+  - 4요소 가중 합산: core_function(0.35) + user_perception(0.25) + area_volume(0.20) + structural(0.20)
+  - 후보별 요소 점수 산출 → 가중 합산 → winner 결정
+
+### Phase 4: HS6 서브헤딩 분류 (GRI 6)
+- `scripts/build_subheading_kb.py` 신규: HS6 KB 구축
+  - 관세청 HS부호 Excel + 판결사례 + 소호주규정 통합
+  - 2,822개 HS6 서브헤딩 생성
+- `kb/structured/hs6_subheadings.jsonl` 생성
+- `src/classifier/subheading_resolver.py` 신규: `SubheadingResolver`
+  - 키워드 매칭 + 소호 주규정 + 재질 구성비 + 판결 선례
+
+### Phase 5: 리스크 평가
+- `src/classifier/risk_assessor.py` 신규: `RiskAssessor`
+  - 5개 요인: 점수차(+3.0), EC적용(+2.0), 정보누락(+1.5/개), 판례충돌(+2.0), 관할분기(+1.0)
+  - HIGH (≥5.0) / MED (2.5~5.0) / LOW (<2.5)
+
+### Phase 6: 통합 및 검증
+- `configs/stages.yaml`: `gri_orchestrator` 설정 섹션 추가 (EC 가중치, 리스크 임계값, 서브헤딩 경로)
+- `src/eval/evaluator.py`: HS6 정확도, GRI 분포, Risk/EC 메트릭 확장
+- `src/eval/report.py`: `format_gri_extended()` GRI 확장 통계 리포트 추가
+- `scripts/test_gri_pipeline.py` 신규: 10건 end-to-end 통합 테스트
+  - 8개 필수 출력 항목 검증, GRI 순차 순서 확인, EC/Risk/HS6 출력 확인
+  - **10/10 전건 PASS**
+
+### 파일 추가
+- `src/classifier/input_model.py`
+- `src/classifier/gri_orchestrator.py`
+- `src/classifier/essential_character.py`
+- `src/classifier/subheading_resolver.py`
+- `src/classifier/risk_assessor.py`
+- `scripts/migrate_rule_ids.py`
+- `scripts/normalize_cases.py`
+- `scripts/build_subheading_kb.py`
+- `scripts/test_gri_pipeline.py`
+
+### 파일 수정
+- `src/classifier/types.py`: 6개 새 데이터클래스, Candidate.hs6, ClassificationResult 확장
+- `src/classifier/pipeline.py`: GRIOrchestrator 통합, classify_structured() 추가
+- `src/kb/rules.py`: v2 rule 파일 우선 로드
+- `src/classifier/reranker.py`: v2 rule 파일 + Evidence.meta rule_id 노출
+- `configs/stages.yaml`: gri_orchestrator 설정 추가
+- `src/eval/evaluator.py`: GRI 확장 메트릭
+- `src/eval/report.py`: GRI 확장 리포트
+
+### 생성 데이터
+- `kb/structured/hs4_rule_chunks_v2.jsonl`: 11,912 rules (rule_id 포함)
+- `data/ruling_cases/normalized_cases_rule.jsonl`: 7,198건 정규화
+- `data/ruling_cases/normalization_comparison.json`: 정규화 품질 비교
+- `kb/structured/hs6_subheadings.jsonl`: 2,822 HS6 서브헤딩
+
+---
+
 ## 2026-02-08: Pipeline 성능 개선 + LightGBM Ranker Sanity Check
 
 ### 문제
@@ -282,4 +389,4 @@
 
 ---
 
-**마지막 업데이트**: 2026-02-08
+**마지막 업데이트**: 2026-02-20

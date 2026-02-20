@@ -79,18 +79,11 @@ def build_rank_dataset_with_legal(
 
     # 데이터셋 생성
     # LegalGate features 추가
-    feature_names_base = CandidateFeatures.feature_names()
-    feature_names_legal = feature_names_base + [
-        'f_legal_heading_term',
-        'f_legal_include_support',
-        'f_legal_exclude_conflict',
-        'f_legal_redirect_penalty',
-    ]
-
+    # CandidateFeatures.feature_names()에 LegalGate 피처 포함됨
     dataset = {
         'queries': [],       # query_id -> text
         'features': [],      # (query_id, doc_id, feature_vector, label)
-        'feature_names': feature_names_legal,
+        'feature_names': CandidateFeatures.feature_names(),
     }
 
     stats = {
@@ -196,27 +189,16 @@ def build_rank_dataset_with_legal(
                 input_attrs_8axis=input_attrs_8axis
             )
 
-            # LegalGate features 추가
+            # LegalGate features 추가 (CandidateFeatures에 직접 설정)
             legal_result = legal_results.get(cand.hs4)
             if legal_result:
-                f_legal_heading_term = legal_result.get('heading_term_score', 0.0)
-                f_legal_include_support = legal_result.get('include_support_score', 0.0)
-                f_legal_exclude_conflict = legal_result.get('exclude_conflict_score', 0.0)
-                f_legal_redirect_penalty = legal_result.get('redirect_penalty', 0.0)
-            else:
-                # 결과가 없으면 0
-                f_legal_heading_term = 0.0
-                f_legal_include_support = 0.0
-                f_legal_exclude_conflict = 0.0
-                f_legal_redirect_penalty = 0.0
+                features_base.f_legal_heading_term = legal_result.get('heading_term_score', 0.0)
+                features_base.f_legal_include_support = legal_result.get('include_support_score', 0.0)
+                features_base.f_legal_exclude_conflict = legal_result.get('exclude_conflict_score', 0.0)
+                features_base.f_legal_redirect_penalty = legal_result.get('redirect_penalty', 0.0)
 
-            # 벡터 결합
-            feature_vector = features_base.to_vector() + [
-                f_legal_heading_term,
-                f_legal_include_support,
-                f_legal_exclude_conflict,
-                f_legal_redirect_penalty,
-            ]
+            # 벡터 (to_vector()에 LegalGate 피처 포함)
+            feature_vector = features_base.to_vector()
 
             label = 1 if cand.hs4 == hs_heading else 0
 

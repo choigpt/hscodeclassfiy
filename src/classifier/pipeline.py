@@ -21,6 +21,8 @@ from .gri_signals import GRISignals, detect_gri_signals, detect_parts_signal
 from .attribute_extract import GlobalAttributes, extract_attributes
 from .legal_gate import LegalGate
 from .fact_checker import FactSufficiencyChecker
+from .gri_orchestrator import GRIOrchestrator
+from .input_model import ClassificationInput
 
 
 class HSPipeline:
@@ -82,6 +84,12 @@ class HSPipeline:
         self.ranker_model = None
         if ranker_model_path and use_ranker:
             self._load_ranker(ranker_model_path)
+
+        # GRI 순차 오케스트레이터
+        self.gri_orchestrator = GRIOrchestrator(
+            legal_gate=self.legal_gate,
+            reranker=self.reranker,
+        )
 
     def _load_ranker(self, path: str):
         """LightGBM ranker 모델 로드"""
@@ -296,63 +304,6 @@ class HSPipeline:
         debug['merged_candidates_count'] = len(candidates)
         debug['merge_stats'] = merge_debug
 
-        # KB confidence gate 계산 (rerank 전 pre-score 기반)
-        kb_margin = 0.0
-        kb_locked = False
-        kb_top1_hs4 = None
-        kb_top1_card_count = 0
-
-        if len(kb_candidates) >= 2:
-            # KB top1과 top2의 KB score로 confidence 판단
-            kb_top1 = kb_candidates[0]
-            kb_top2 = kb_candidates[1]
-            kb_top1_hs4 = kb_top1.hs4
-
-            # KB retrieval evidence의 meta에서 kb_score 가져오기
-            kb_top1_score = 0.0
-            kb_top2_score = 0.0
-            for ev in kb_top1.evidence:
-                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
-                    kb_top1_score = ev.meta['kb_score']
-                    break
-            for ev in kb_top2.evidence:
-                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
-                    kb_top2_score = ev.meta['kb_score']
-                    break
-
-            # KB score 차이
-            kb_margin = kb_top1_score - kb_top2_score
-            kb_top1_card_count = int(kb_top1_score)  # For debug logging
-
-            # Lock 조건: KB top1 score >= 10.0 AND top2보다 3.0 이상 높음
-            KB_SCORE_THRESHOLD = 10.0
-            KB_MARGIN_THRESHOLD = 3.0
-            if kb_top1_score >= KB_SCORE_THRESHOLD and kb_margin >= KB_MARGIN_THRESHOLD:
-                kb_locked = True
-
-        elif len(kb_candidates) == 1:
-            # KB 후보가 1개만 있으면 그것의 score로 판단
-            kb_top1_hs4 = kb_candidates[0].hs4
-            kb_top1_score = 0.0
-            for ev in kb_candidates[0].evidence:
-                if ev.kind == 'kb_retrieval' and 'kb_score' in ev.meta:
-                    kb_top1_score = ev.meta['kb_score']
-                    break
-            kb_margin = kb_top1_score
-            kb_top1_card_count = int(kb_top1_score)  # For debug logging
-            # Single KB candidate: lock if score >= 15.0 (very high confidence)
-            if kb_top1_score >= 15.0:
-                kb_locked = True  # 단독이므로 margin = card count
-
-        debug['kb_margin'] = round(kb_margin, 2)
-        debug['kb_locked'] = kb_locked
-        debug['kb_top1_hs4'] = kb_top1_hs4
-        debug['kb_top1_card_count'] = kb_top1_card_count
-        # Debug: show card counts for top2 as well
-        if len(kb_candidates) >= 2:
-            kb_top2_card_count_debug = sum(1 for ev in kb_candidates[1].evidence if ev.kind in ['card_keyword', 'card_exact'])
-            debug['kb_top2_card_count'] = kb_top2_card_count_debug
-
         # not_in_model 표시
         model_classes = self.get_model_classes()
         not_in_model_list = []
@@ -362,239 +313,88 @@ class HSPipeline:
         if not_in_model_list:
             debug['not_in_model_hs4'] = not_in_model_list
 
-        # Step 3.5: LegalGate (GRI 1 기반 법적 필터링) - Ablation 토글
-        if self.use_legal_gate and self.legal_gate:
-            candidates, redirect_hs4s, legal_gate_debug = self.legal_gate.apply(text, candidates)
-            debug['legal_gate'] = legal_gate_debug
-
-            # 리다이렉트 HS4 추가 (새로운 후보)
-            if redirect_hs4s:
-                for rhs4 in redirect_hs4s:
-                    # 간단한 Candidate 생성 (reranker에서 점수 계산)
-                    from .types import Evidence
-                    redirect_cand = Candidate(
-                        hs4=rhs4,
-                        score_ml=0.0,
-                        evidence=[Evidence(
-                            kind="legal_redirect",
-                            source_id=rhs4,
-                            text=f"주규정에 의한 리다이렉트: 제{rhs4}호",
-                            weight=0.8
-                        )]
-                    )
-                    candidates.append(redirect_cand)
-
-            debug['after_legal_gate_count'] = len(candidates)
-
-            # LegalGate 통과 후 후보가 1개면 즉시 반환 (GRI 1로 확정)
-            if len(candidates) == 1:
-                single_cand = candidates[0]
-                single_cand.score_total = 1.0
-                single_cand.features['gri1_definitive'] = True
-                debug['gri1_single_candidate'] = True
-                debug['gri_decision'] = 'GRI 1 - 단일 호로 확정'
-                return ClassificationResult(
-                    input_text=text,
-                    topk=[single_cand],
-                    decision=DecisionStatus(status="AUTO", reason="GRI 1 - 단일 호로 확정", confidence=1.0),
-                    questions=[],
-                    debug=debug
-                )
-            elif len(candidates) == 0:
-                # LegalGate에서 모든 후보가 제외됨 → 질문 필요
-                debug['gri1_all_excluded'] = True
-                debug['gri_decision'] = 'GRI 1 - 모든 후보 제외됨'
-                return ClassificationResult(
-                    input_text=text,
-                    topk=[],
-                    decision=DecisionStatus(status="ASK", reason="GRI 1 - 모든 후보 제외됨", confidence=0.0),
-                    questions=["입력 정보로는 분류할 수 없습니다. 추가 정보를 제공해주세요."],
-                    debug=debug
-                )
-            else:
-                # 복수 후보가 남음 → GRI 2/3/5 적용
-                debug['gri_decision'] = f'GRI 1 불충분 ({len(candidates)}개 후보) → GRI 2/3/5 적용'
-
-        # Step 4: Rerank (GRI + 속성 피처 포함) - Ablation 토글
-        # GRI 2/3/5는 LegalGate 통과 후 복수 후보가 남은 경우에만 활성화
-        # 8축 속성은 use_8axis 플래그에 따라 전달
-        # NOTE: 8축 추출을 w_ml 계산 전으로 이동 (fact-insufficient 판정에 필요)
+        # 8축 속성 추출
         input_attrs_8axis = None
         if self.use_8axis:
             from .attribute_extract import extract_attributes_8axis
             input_attrs_8axis = extract_attributes_8axis(text)
 
-        # GRI 2/3/5 적용 여부 결정
-        apply_gri_235 = (
-            not self.use_legal_gate or
-            (self.use_legal_gate and len(candidates) > 1)
-        )
-
-        # Conditional ML weight 계산
-        # ML을 강하게 사용할 조건: short text, fact insufficient, ambiguous
-        w_ml = 0.2  # 기본 낮은 가중치
-        use_strong_ml = False
-
-        # 조건 1: 텍스트가 짧음 (< 20자)
-        if len(text) < 20:
-            w_ml = 0.4
-            use_strong_ml = True
-
-        # 조건 2: Fact insufficient — 주요 8축 속성 누락 기반
-        # material, processing_state, function_use, completeness는
-        # HS 분류의 핵심 판별축. 이 중 2개 이상 누락되면 KB 키워드 매칭의
-        # 신뢰도가 급격히 떨어지므로 ML 통계 패턴으로 보완해야 한다.
-        # (기존 questions_generated_count 조건은 이 시점에서 미설정이라 dead code였음)
-        fact_insufficient = False
-        missing_axis_count = 0
-        if input_attrs_8axis is not None:
-            _key_axes = ['material', 'processing_state', 'function_use', 'completeness']
-            missing_axis_count = sum(
-                1 for ax_id in _key_axes
-                if not input_attrs_8axis.get_axis(ax_id).values
-            )
-            if missing_axis_count >= 2:
-                fact_insufficient = True
-                # 3개 이상 누락이면 ML을 더 강하게
-                w_ml = 0.6 if missing_axis_count >= 3 else 0.5
-                use_strong_ml = True
-        debug['fact_insufficient'] = fact_insufficient
-        debug['missing_axis_count'] = missing_axis_count
-
-        # 조건 3: KB 후보가 너무 적음 (< 5개)
-        if len(kb_candidates) < 5:
-            w_ml = max(w_ml, 0.4)
-            use_strong_ml = True
-
-        # 조건 4: KB locked - ML을 더 약하게 (최종 override)
-        if kb_locked:
-            w_ml = 0.05  # KB가 확신있으면 ML 거의 무시
-            use_strong_ml = False
-
-        debug['w_ml'] = round(w_ml, 2)
-        debug['use_strong_ml'] = use_strong_ml
-
-        # ML weight를 candidates에 적용 (score_ml에 가중치)
-        for cand in candidates:
-            if hasattr(cand, 'score_ml') and cand.score_ml > 0:
-                cand.features['w_ml'] = w_ml
-                # score_ml을 가중치 적용한 값으로 조정 (reranker에서 사용)
-                cand.features['weighted_ml_score'] = cand.score_ml * w_ml
-
+        # Rerank 함수 (GRI 3에서 사용)
         ranker_model_to_use = self.ranker_model if self.use_ranker else None
 
-        # KB lock 안정화: rerank를 넓은 풀(internal_topk)로 수행한 뒤
-        # KB lock 적용 후 최종 topk로 줄인다.
-        # 기존에는 topk=5로 rerank해서 KB top1이 top5 밖이면 lock 불가였음.
-        _INTERNAL_TOPK = 20
-        internal_topk = max(topk, _INTERNAL_TOPK)
+        def rerank_fn(cands):
+            reranked, _ = self.reranker.rerank(
+                text, cands, topk=len(cands),
+                gri_signals=gri_signals if self.use_gri else None,
+                input_attrs=input_attrs,
+                input_attrs_8axis=input_attrs_8axis,
+                model_classes=model_classes,
+                ranker_model=ranker_model_to_use,
+            )
+            return reranked
 
-        reranked, rerank_stats = self.reranker.rerank(
-            text,
-            candidates,
-            topk=internal_topk,
-            gri_signals=gri_signals if (self.use_gri and apply_gri_235) else None,
-            input_attrs=input_attrs,
-            input_attrs_8axis=input_attrs_8axis,
-            model_classes=model_classes,
-            ranker_model=ranker_model_to_use
-        )
-        rerank_stats['gri_235_applied'] = apply_gri_235
-
-        # KB lock 적용: KB top1이 locked이면 최종 top1을 강제로 kb_top1으로
-        top1_source = "ranker"
-        if kb_locked and kb_top1_hs4:
-            # reranked(internal_topk=20)에서 kb_top1_hs4 찾기
-            kb_top1_in_reranked = None
-            kb_top1_rank = -1
-            for i, cand in enumerate(reranked):
-                if cand.hs4 == kb_top1_hs4:
-                    kb_top1_in_reranked = cand
-                    kb_top1_rank = i
-                    break
-
-            # 넓은 풀(20) 내에서 KB top1을 찾아 top1으로 이동
-            if kb_top1_in_reranked:
-                reranked.remove(kb_top1_in_reranked)
-                reranked.insert(0, kb_top1_in_reranked)
-                top1_source = "kb_locked"
-                debug['kb_lock_applied'] = True
-                debug['kb_top1_original_rank'] = kb_top1_rank
-
-        # 최종 topk로 잘라냄 (외부 인터페이스 유지)
-        reranked = reranked[:topk]
-        debug['top1_source'] = top1_source
-
-        # Retriever 사용 여부 명시적 기록
-        debug['retriever_used'] = debug.get('ml_used', False)  # ML 후보 생성 여부
-
-        # Ranker 사용 여부 명시적 기록 (3-level tracking)
-        debug['use_ranker'] = self.use_ranker  # Config: ranker 활성화 여부
-        debug['ranker_loaded'] = bool(self.ranker_model)  # Model: 모델 로드 성공 여부
-        debug['ranker_applied'] = (self.use_ranker and bool(self.ranker_model) and len(candidates) > 0)  # Actual: 실제 적용 여부
-        # Backward compatibility
+        # Retriever/Ranker 사용 여부 기록
+        debug['retriever_used'] = debug.get('ml_used', False)
+        debug['use_ranker'] = self.use_ranker
+        debug['ranker_loaded'] = bool(self.ranker_model)
+        debug['ranker_applied'] = (self.use_ranker and bool(self.ranker_model) and len(candidates) > 0)
         debug['ranker_used'] = debug['ranker_applied']
 
-        debug['rerank_stats'] = rerank_stats
-        debug['reranked_top5'] = [
-            {
-                'hs4': c.hs4,
-                'score_total': round(c.score_total, 4),
-                'score_ml': round(c.score_ml, 4),
-                'score_card': round(c.score_card, 4),
-                'score_rule': round(c.score_rule, 4),
-                'evidence_count': len(c.evidence),
-                'in_model': c.hs4 in model_classes,
-                'features': c.features
-            }
-            for c in reranked
-        ]
+        # ============================================================
+        # GRI 순차 오케스트레이터 호출
+        # ============================================================
+        result = self.gri_orchestrator.classify(
+            input_data=text,
+            ml_candidates=ml_candidates,
+            kb_candidates=kb_candidates,
+            merged_candidates=candidates,
+            gri_signals=gri_signals if self.use_gri else None,
+            input_attrs=input_attrs,
+            input_attrs_8axis=input_attrs_8axis,
+            rerank_fn=rerank_fn,
+            debug=debug,
+        )
 
-        # Step 5: 저신뢰도 판정
-        scores = [c.score_total for c in reranked]
-        low_confidence = self.clarifier.is_low_confidence(scores)
-        debug['low_confidence_check'] = {
-            'p1': round(scores[0], 4) if scores else 0,
-            'p2': round(scores[1], 4) if len(scores) > 1 else 0,
-            'result': low_confidence
-        }
-
-        # no_hits 체크
-        if rerank_stats.get('no_hits', False):
-            low_confidence = True
-            debug['no_kb_hits'] = True
-
-        # Step 6: GRI + 속성 충돌 기반 질문 생성 (Ablation 토글)
-        questions = []
-        if low_confidence and self.use_questions:
-            hs4_list = [c.hs4 for c in reranked]
+        # 저신뢰도 질문 생성 (기존 호환)
+        if result.decision.status != "AUTO" and self.use_questions:
+            hs4_list = [c.hs4 for c in result.topk]
             questions = self.clarifier.get_questions_with_context(
                 hs4_list,
                 gri_signals=gri_signals,
                 input_attrs=input_attrs,
-                no_kb_hits=rerank_stats.get('no_hits', False),
+                no_kb_hits=False,
                 has_parts_signal=parts_signal['is_parts'],
                 reranker=self.reranker,
                 max_questions=3
             )
+            if questions:
+                result.questions = questions
 
-        # Decision 생성
-        if low_confidence:
-            status = "ASK"
-            reason = "저신뢰도"
-            confidence = scores[0] if scores else 0.0
-        else:
-            status = "AUTO"
-            reason = "정상 분류"
-            confidence = scores[0] if scores else 0.0
+        return result
 
-        return ClassificationResult(
-            input_text=text,
-            topk=reranked,
-            decision=DecisionStatus(status=status, reason=reason, confidence=confidence),
-            questions=questions,
-            debug=debug
-        )
+    def classify_structured(
+        self,
+        input_data: ClassificationInput,
+        topk: int = 5,
+    ) -> ClassificationResult:
+        """
+        구조화 입력 기반 분류 (ClassificationInput)
+
+        Args:
+            input_data: ClassificationInput 구조화 입력
+            topk: 반환할 상위 후보 수
+
+        Returns:
+            ClassificationResult
+        """
+        # enriched text로 기존 classify 호출
+        enriched_text = input_data.to_enriched_text()
+        result = self.classify(enriched_text, topk=topk)
+
+        # 구조화 입력 정보를 debug에 추가
+        result.debug['structured_input'] = input_data.to_dict()
+
+        return result
 
     def save_diagnostics(self, output_dir: str = "artifacts/diagnostics"):
         """진단 결과 저장"""

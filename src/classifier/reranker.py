@@ -74,6 +74,12 @@ class CandidateFeatures:
     f_conflict_penalty: float = 0.0        # 후보간 속성 충돌
     f_uncertainty_penalty: float = 0.0     # 속성 추출 불확실성
 
+    # LegalGate 피처 (학습 시 build_dataset_legal에서 추가)
+    f_legal_heading_term: float = 0.0
+    f_legal_include_support: float = 0.0
+    f_legal_exclude_conflict: float = 0.0
+    f_legal_redirect_penalty: float = 0.0
+
     # 최종 점수
     score_total: float = 0.0
 
@@ -117,6 +123,11 @@ class CandidateFeatures:
             'f_legal_scope_match_score': round(self.f_legal_scope_match_score, 4),
             'f_conflict_penalty': round(self.f_conflict_penalty, 4),
             'f_uncertainty_penalty': round(self.f_uncertainty_penalty, 4),
+            # LegalGate 피처
+            'f_legal_heading_term': round(self.f_legal_heading_term, 4),
+            'f_legal_include_support': round(self.f_legal_include_support, 4),
+            'f_legal_exclude_conflict': round(self.f_legal_exclude_conflict, 4),
+            'f_legal_redirect_penalty': round(self.f_legal_redirect_penalty, 4),
             'score_total': round(self.score_total, 4),
         }
 
@@ -160,6 +171,11 @@ class CandidateFeatures:
             self.f_legal_scope_match_score,
             self.f_conflict_penalty,
             self.f_uncertainty_penalty,
+            # LegalGate 피처
+            self.f_legal_heading_term,
+            self.f_legal_include_support,
+            self.f_legal_exclude_conflict,
+            self.f_legal_redirect_penalty,
         ]
 
     @staticmethod
@@ -177,6 +193,9 @@ class CandidateFeatures:
             'f_function_match_score', 'f_form_match_score', 'f_completeness_match_score',
             'f_quant_rule_match_score', 'f_legal_scope_match_score',
             'f_conflict_penalty', 'f_uncertainty_penalty',
+            # LegalGate 피처
+            'f_legal_heading_term', 'f_legal_include_support',
+            'f_legal_exclude_conflict', 'f_legal_redirect_penalty',
         ]
 
 
@@ -334,8 +353,10 @@ class HSReranker:
         return 'soft'
 
     def _load_rules(self):
-        """규칙 청크 로드"""
-        rules_file = Path(self.rules_path)
+        """규칙 청크 로드 (v2 파일 우선)"""
+        # v2 파일 우선 로드
+        v2_path = Path("kb/structured/hs4_rule_chunks_v2.jsonl")
+        rules_file = v2_path if v2_path.exists() else Path(self.rules_path)
         if not rules_file.exists():
             print(f"[Reranker] 경고: 규칙 파일 없음: {rules_file}")
             return
@@ -382,7 +403,8 @@ class HSReranker:
 
                     # 규칙 메타데이터 확장
                     self.rules[hs4].append({
-                        'chunk_id': f"{hs4}_{idx}",
+                        'chunk_id': rule.get('rule_id', f"{hs4}_{idx}"),
+                        'rule_id': rule.get('rule_id', f"{hs4}_{idx}"),
                         'chunk_type': chunk_type,
                         'signals': signals,
                         'text': text[:300],
@@ -390,6 +412,8 @@ class HSReranker:
                         'polarity': polarity,
                         'strength': strength,
                         'quant_rule': rule.get('quant_rule'),
+                        'source': rule.get('source', ''),
+                        'hs_version': rule.get('hs_version', '2022'),
                     })
                     count += 1
                 except json.JSONDecodeError:
@@ -1041,7 +1065,14 @@ class HSReranker:
                 source_id=chunk_id,
                 text=rule_text[:160],
                 weight=delta,
-                meta={'matched_signals': matched_signals, 'chunk_type': chunk_type, 'strength': strength}
+                meta={
+                    'matched_signals': matched_signals,
+                    'chunk_type': chunk_type,
+                    'strength': strength,
+                    'rule_id': rule.get('rule_id', chunk_id),
+                    'source': rule.get('source', ''),
+                    'hs_version': rule.get('hs_version', '2022'),
+                }
             ))
 
         return score, evidences, inc_hits, exc_hits, has_exclude_conflict, note_support
@@ -1150,7 +1181,8 @@ class HSReranker:
         input_attrs: Optional[GlobalAttributes] = None,
         input_attrs_8axis: Optional[GlobalAttributes8Axis] = None,
         model_classes: Optional[Set[str]] = None,
-        ranker_model: Optional[Any] = None
+        ranker_model: Optional[Any] = None,
+        legal_gate_debug: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[Candidate], Dict[str, Any]]:
         """후보 재정렬 (8축 속성 지원)"""
         # GRI/속성 탐지
@@ -1205,6 +1237,15 @@ class HSReranker:
                 stats['exclude_conflict_count'] += 1
             if features.f_note_hard_exclude or features.f_quant_hard_exclude:
                 stats['hard_exclude_count'] += 1
+
+            # LegalGate 피처 주입 (학습 시 build_dataset_legal과 동일하게)
+            if legal_gate_debug is not None:
+                lg_results = legal_gate_debug.get('results', {})
+                lg_result = lg_results.get(cand.hs4, {})
+                features.f_legal_heading_term = lg_result.get('heading_term_score', 0.0)
+                features.f_legal_include_support = lg_result.get('include_support_score', 0.0)
+                features.f_legal_exclude_conflict = lg_result.get('exclude_conflict_score', 0.0)
+                features.f_legal_redirect_penalty = lg_result.get('redirect_penalty', 0.0)
 
             # 점수 계산
             if ranker_model is not None:
